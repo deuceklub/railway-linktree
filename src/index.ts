@@ -36,14 +36,13 @@ interface Project {
   };
 }
 
-interface ProjectsResponse {
-  data: {
-    me: {
-      projects: {
-        edges: { node: Project }[];
-      };
-    };
-  };
+interface WorkspacesResponse {
+  data: { me: { workspaces: { id: string; name: string }[] } };
+  errors?: { message: string }[];
+}
+
+interface WorkspaceProjectsResponse {
+  data: { workspace: { projects: { edges: { node: Project }[] } } };
   errors?: { message: string }[];
 }
 
@@ -54,68 +53,48 @@ interface ProjectLink {
   railwayUrl: string;
 }
 
+async function gql<T>(query: string, token: string): Promise<T> {
+  const response = await fetch(RAILWAY_API_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ query }),
+  });
+  if (!response.ok) throw new Error(`Railway API error: ${response.status} ${response.statusText}`);
+  const json = (await response.json()) as { data: T; errors?: { message: string }[] };
+  if (json.errors?.length) throw new Error(`Railway API error: ${json.errors[0].message}`);
+  return json.data;
+}
+
 async function fetchRailwayProjects(): Promise<ProjectLink[]> {
   if (!RAILWAY_API_TOKEN) {
     throw new Error('RAILWAY_API_TOKEN environment variable is not set');
   }
 
-  const query = `
-    query {
-      me {
-        projects {
-          edges {
-            node {
-              id
-              name
-              description
-              environments {
-                edges {
-                  node {
-                    name
-                    serviceInstances {
-                      edges {
-                        node {
-                          domains {
-                            customDomains {
-                              domain
-                            }
-                            serviceDomains {
-                              domain
-                            }
-                          }
-                        }
-                      }
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-  `;
+  // Step 1: get workspaces
+  const meData = await gql<WorkspacesResponse['data']>(
+    `{ me { workspaces { id name } } }`,
+    RAILWAY_API_TOKEN
+  );
+  const workspaces = meData.me.workspaces;
 
-  const response = await fetch(RAILWAY_API_URL, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${RAILWAY_API_TOKEN}`,
-    },
-    body: JSON.stringify({ query }),
-  });
+  // Step 2: fetch projects from all workspaces in parallel
+  const projectsPerWorkspace = await Promise.all(
+    workspaces.map((ws) =>
+      gql<WorkspaceProjectsResponse['data']>(
+        `{ workspace(workspaceId: "${ws.id}") { projects { edges { node {
+          id name description
+          environments { edges { node { name serviceInstances { edges { node {
+            domains { customDomains { domain } serviceDomains { domain } }
+          } } } } } }
+        } } } } }`,
+        RAILWAY_API_TOKEN!
+      )
+    )
+  );
 
-  if (!response.ok) {
-    throw new Error(`Railway API error: ${response.status} ${response.statusText}`);
-  }
+  const allProjects = projectsPerWorkspace.flatMap((d) => d.workspace.projects.edges.map((e) => e.node));
 
-  const json = (await response.json()) as ProjectsResponse;
-
-  if (json.errors?.length) {
-    throw new Error(`Railway API error: ${json.errors[0].message}`);
-  }
-
-  const projects = json.data.me.projects.edges.map(({ node }) => {
+  const projects = allProjects.map((node) => {
     // Find production environment (or first env) to get URL
     const envs = node.environments.edges.map((e) => e.node);
     const prodEnv = envs.find((e) => e.name.toLowerCase() === 'production') ?? envs[0];
