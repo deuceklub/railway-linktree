@@ -65,23 +65,52 @@ async function gql<T>(query: string, token: string): Promise<T> {
   return json.data;
 }
 
+// Workspace tokens are rejected by the account-scoped `me` query, which is what
+// caused "Not Authorized". Prefer an explicit WORKSPACE_ID, then the token-scoped
+// `apiToken` lookup, and only fall back to `me` for personal account tokens.
+async function getWorkspaceIds(token: string): Promise<string[]> {
+  const configured = (process.env.WORKSPACE_ID ?? '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (configured.length) return configured;
+
+  try {
+    const t = await gql<{ apiToken: { workspaces: { id: string }[] } | null }>(
+      `{ apiToken { workspaces { id } } }`,
+      token
+    );
+    const ids = t.apiToken?.workspaces?.map((w) => w.id) ?? [];
+    if (ids.length) return ids;
+  } catch {
+    // fall through to the account-token lookup
+  }
+
+  const me = await gql<WorkspacesResponse['data']>(`{ me { workspaces { id name } } }`, token);
+  return me.me.workspaces.map((w) => w.id);
+}
+
+// Comma-separated project names to leave off the public page, e.g. HIDE_PROJECTS="personal-finance,health-hub"
+const HIDDEN = new Set(
+  (process.env.HIDE_PROJECTS ?? '')
+    .split(',')
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean)
+);
+
 async function fetchRailwayProjects(): Promise<ProjectLink[]> {
   if (!RAILWAY_API_TOKEN) {
     throw new Error('RAILWAY_API_TOKEN environment variable is not set');
   }
 
-  // Step 1: get workspaces
-  const meData = await gql<WorkspacesResponse['data']>(
-    `{ me { workspaces { id name } } }`,
-    RAILWAY_API_TOKEN
-  );
-  const workspaces = meData.me.workspaces;
+  // Step 1: find the workspaces this token can see
+  const workspaceIds = await getWorkspaceIds(RAILWAY_API_TOKEN);
 
   // Step 2: fetch projects from all workspaces in parallel
   const projectsPerWorkspace = await Promise.all(
-    workspaces.map((ws) =>
+    workspaceIds.map((id) =>
       gql<WorkspaceProjectsResponse['data']>(
-        `{ workspace(workspaceId: "${ws.id}") { projects { edges { node {
+        `{ workspace(workspaceId: "${id}") { projects { edges { node {
           id name description
           environments { edges { node { name serviceInstances { edges { node {
             domains { customDomains { domain } serviceDomains { domain } }
@@ -92,7 +121,9 @@ async function fetchRailwayProjects(): Promise<ProjectLink[]> {
     )
   );
 
-  const allProjects = projectsPerWorkspace.flatMap((d) => d.workspace.projects.edges.map((e) => e.node));
+  const allProjects = projectsPerWorkspace
+    .flatMap((d) => d.workspace.projects.edges.map((e) => e.node))
+    .filter((p) => !HIDDEN.has(p.name.toLowerCase()));
 
   const projects = allProjects.map((node) => {
     // Find production environment (or first env) to get URL
@@ -295,9 +326,32 @@ function escapeHtml(str: string): string {
     .replace(/'/g, '&#039;');
 }
 
-app.get('/', async (_req, res) => {
+// Cache for a minute so page loads don't hammer the API, and keep serving the last
+// good list if Railway has a hiccup. A restart clears the cache.
+const CACHE_MS = 60_000;
+let cache: { at: number; projects: ProjectLink[] } | null = null;
+
+async function getProjects(): Promise<ProjectLink[]> {
+  if (cache && Date.now() - cache.at < CACHE_MS) return cache.projects;
   try {
     const projects = await fetchRailwayProjects();
+    cache = { at: Date.now(), projects };
+    return projects;
+  } catch (err) {
+    console.error('Failed to refresh projects:', err instanceof Error ? err.message : err);
+    if (cache) return cache.projects;
+    throw err;
+  }
+}
+
+// Lightweight route for Railway's healthcheck; does not call the Railway API.
+app.get('/healthz', (_req, res) => {
+  res.status(200).send('ok');
+});
+
+app.get('/', async (_req, res) => {
+  try {
+    const projects = await getProjects();
     res.send(renderPage(projects));
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
